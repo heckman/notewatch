@@ -17,8 +17,8 @@ set -o nounset
 
 [[ "${1-}" = "-x" ]] && { set -o xtrace; shift; }
 
-trap 'e="${?:-72}"; /bin/echo "error on line $LINENO"' ERR
-trap 'e="${?:-72}"; /bin/echo "[ EXIT $e ]"; exit "$e"' EXIT
+trap '/bin/echo "error on line $LINENO"' ERR
+trap '/bin/echo "[ EXIT $? ]"' EXIT
 
 
 # adapted from https://stackoverflow.com/a/36625791
@@ -101,7 +101,7 @@ function awk_batch_reader() {
 					print "update " extant[inode]
 			}
 		}
-	' | while IFS=$'\t' read cmd file1 file2 new; do
+	' | while IFS=$'\t' read -r cmd file1 file2 new; do
 		echo "handle_$cmd" "$file1" "$file2" "$new"
 	done
 }
@@ -203,7 +203,7 @@ function announce() { local announcement_name="$1"
 	esac
 }
 
-
+# shellcheck disable=SC2034
 function define_custom_errors() {
 	  NW_ERR_CANT_READ_PID_FILE=128  ERR_MSG_128="can't read pid file"
 	NW_ERR_CANT_REMOVE_PID_FILE=129  ERR_MSG_129="can't remove pid file"
@@ -216,7 +216,8 @@ function define_custom_errors() {
 ###############################################################################
 # UTILITY FUNCTIONS
 ###############################################################################
-function define_error() { :;}
+
+# shellcheck disable=SC2034
 function define_common_errors() {
 					  ERR_USAGE=64  ERR_MSG_64="invalid usage"
 				ERR_INVALID_PID=4   ERR_MSG_4="badly formatted pid"
