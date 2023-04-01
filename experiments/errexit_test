@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# note-watch
+
+set -o errexit
+# set -o pipefail
+set -o nounset
+# set -o xtrace
+# set -o functrace
+set -o errtrace
+
+[[ "${1-}" = "-x" ]] && { set -o xtrace; shift; }
+
+
+
+# trap 'e="${?:-72}"; echo "[ EXIT $e ] from line $LINENO"; exit "$e"' EXIT
+
+trap 'error_handler "$?" "$LINENO"' ERR
+
+et_err_foo=7
+
+function error_handler() { local exit_status="$1" line_number="$2"
+    echo error "$exit_status" on line "$line_number">&2
+    # exit "$exit_status"
+}
+
+function is_file() { local possible_file="${1}"
+    [[ -f "$possible_file" ]]
+}
+
+# Default value for `message` defined in body
+function die() { local message="${1-}" exit_status="${2-$?}"
+    [[ exit_status -eq 0 ]] && exit_status=1
+    echo "${message:-Error in function: ${FUNCNAME[1]}}" >&2
+    return "${exit_status}"
+}
+
+die(){ error ${1:-} ${2:-}; exit $1; }
+
+error() { local exit_status="${1:-$?}" argument="${2:-}"
+    [[ -n arugment ]] && argument=": $argument"
+    echo "ERROR [$exit_status]$argument" >&2
+    return "${exit_status}"
+}
+
+test_error() {
+    is_file "$1" || error 12 "$1"
+}
+
+nested_error() {
+    test_error "$1" || error 4 "$1" # not trapped by ERR if caller ||'s it
+    echo foo
+    return 21
+}
+
+nested_error "$1" || echo $? # catches the error and the function completes
+nested_error "$1" # function aborts when line has exit_status > 0
+
+
+
+echo [ DONE ]
+exit 0
+
+
+
+# Error trapping here is too complicated and doesnt work right"
+trap 'echo "[ EXIT $? ]"' EXIT
+trap 'printf "Terminating with exit status %s on line %d\n" "$?" "$LINENO"' ERR
+# Default value for `message` defined in body
+function error() { local exit_status="${1:-$?}" message="${2:-}"
+    if [[ -z "$message" ]]; then
+        message="$(
+            while IFS= read -rt0 message_from_stdin; do
+                printf %s "$message_from_stdin"
+            done
+        )"
+    fi
+    if [[ -z "$message" ]]; then
+        message="code ${exit_status} in ${FUNCNAME[1]}"
+    fi
+    echo "Error: $message" >&2
+    return "${exit_status}"
+}

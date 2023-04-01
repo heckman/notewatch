@@ -1,0 +1,7 @@
+{
+    "editor.formatOnPaste": true,
+    "editor.formatOnSave": true,
+    "diffEditor.wordWrap": "off",
+    "prettier.tabWidth": 4,
+    "editor.insertSpaces": false
+}

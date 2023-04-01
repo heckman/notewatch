@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+#
+
+# set -x
+set -eu
+
+function main() {
+    echo main
+    watchman_demo_1
+    # timeout_demo_2
+    # test_conditional_chain_and_exit_status
+    echo
+}
+###############################################################################
+#  experiments with batchifiying reads
+###############################################################################
+
+function timeout_demo() {
+    # for t in 1 1 1 3 1 2 3 1; do # read -rt 2
+    # for t in 0.5 0.5 1.5 0.5 1.0 1.5 0.5; do # read -rt 1
+    # sub-1 read timeouts don't work in bash 3.2
+    # for t in 0.1 0.1 0.3 0.1 0.2 0.3 0.1; do # read -rt 0.2
+    for t in 0.01 0.01 0.03 0.01 0.02 0.03 0.01; do # read -rt 0.02
+        sleep $t; echo "foo-$t";
+    done | while read -r line; do
+        echo ":>$line"
+        while read -rt 0.02 line; do
+            echo " >$line"
+        done
+        echo "---"
+    done
+}
+
+function batchify() { local timeout="${1:-0.000001}" # command=...
+    while read -r line; do {
+        echo "$line"
+        while read -rt "$timeout" line; do
+            echo "$line"
+        done
+    } | "${@:2:$#-1}"; done
+}
+function batch_handler(){
+    echo "START"
+    cat
+    echo "END"
+}
+function timeout_demo_2() {
+     for t in 0.01 0.01 0.03 0.01 0.02 0.03 0.01; do # read -rt 0.02
+        sleep $t; echo "foo-$t";
+    done | batchify 0.02 'batch_handler'
+}
+function watchman_demo_1() {
+    watchman-wait -m0 -s' ' --fields ino,type,new,exists,name . |
+        batchify 0.02 'watchman_batch_handler'
+
+}
+function watchman_batch_handler() {
+    local -A extant
+    local -A new
+    local extinct=""
+    while IFS=$' ' read -r inode type is_new exists filename; do
+        [[ "$type" = "f" ]] || continue # only process regular files
+        if "$exists"; then
+            extant+=([$inode]="$filename")
+            new+=([$inode]="$is_new")
+        else
+            extinct="${extinct}${inode} ${filename}"$'\n'
+        fi
+    done
+    ### PROCESS NON-EXISTING FILES
+    local -A renamed
+    while IFS=$' ' read -r inode filename; do
+        [[ -n $inode ]] || continue # skip empwty lines
+        if [[ -n "${extant[$inode]:-}" ]]; then
+            renamed+=([$inode]="True")
+            watchman_handle_rename "${filename}" "${extant[$inode]}" "${new[$inode]}"
+        else
+            watchman_handle_remove "${filename}"
+        fi
+    done <<<"$extinct"
+    ### PROCESS EXISTING FILES
+    for inode in "${!extant[@]}"; do
+        "${renamed[$inode]:-False}" && continue # skip renamed files
+        if "${new[$inode]}"; then
+            watchman_handle_create "${extant[$inode]}"
+        else
+            watchman_handle_update "${extant[$inode]}"
+        fi
+    done
+}
+function watchman_handle_rename(){ local from="$1" to="$2" is_new="$3"
+    local warning=""
+    ! "$is_new" && warning=" (WARNING: existing file overwritten)"
+    echo "rename: ${from} -> ${to}${warning}"
+}
+function watchman_handle_remove(){ local filename="$1"
+    echo "remove: $filename"
+}
+function watchman_handle_create(){ local filename="$1"
+    echo "create: $filename"
+}
+function watchman_handle_update(){ local filename="$1"
+    echo "update: $filename"
+}
+###############################################################################
+#  test_conditional_chain_and_exit_status
+###############################################################################
+function test_conditional_chain_and_exit_status() {
+    ## false, false, true
+    assert_chain 'false || false || true'  'foo:2; bar:3; qux:0;'
+    assert_chain 'false || true  || true'  'foo:2; bar:0;' # qux is iielevant
+    assert_chain 'true  || false || true'  'foo:0;' # bar & qux are irrelevant
+    assert_chain 'true  || true  || true'  'foo:0;' # bar & qux are irrelevant
+
+    assert_chain 'false || false && true'  'foo:2; bar:3;' # qux is iielevant
+    assert_chain 'false || true  && true'  'foo:2; bar:0; qux:0;'
+    assert_chain 'true  || false && true'  'foo:0; qux:0;' # bar is irrelevant
+    assert_chain 'true  || true  && true'  'foo:0; qux:0;' # bar is irrelevant
+
+    assert_chain 'false && false || true'  'foo:2; qux:0;' # bar is irrelevant
+    assert_chain 'false && true  || true'  'foo:2; qux:0;' # bar is irrelevant
+    assert_chain 'true  && false || true'  'foo:0; bar:3; qux:0;'
+    assert_chain 'true  && true  || true'  'foo:0; bar:0;' # qux is iielevant
+
+    assert_chain 'false && false && true'  'foo:2;' # bar & qux are irrelevant
+    assert_chain 'false && true  && true'  'foo:2;' # bar & qux are irrelevant
+    assert_chain 'true  && false && true'  'foo:0; bar:3;' # qux is iielevant
+    assert_chain 'true  && true  && true'  'foo:0; bar:0; qux:0;'
+
+}
+function assert_chain(){
+    foo=$(grep '^true ' <<< "$1" >/dev/null && echo 0 || echo 2)
+    bar=$(grep ' true ' <<< "$1" >/dev/null && echo 0 || echo 3)
+    qux=$(grep ' true$' <<< "$1" >/dev/null && echo 0 || echo 4)
+    C1=$(grep -E '^[^|&]+&&' <<< "$1" >/dev/null && echo '&&' || echo '||')
+    C2=$(grep -E '&&[^|&]+$' <<< "$1" >/dev/null && echo '&&' || echo '||')
+    # echo $foo $bar $qux
+    echo $2
+    assert_output \
+    "$1" \
+    "$2" \
+'{ echo -n foo; (exit '$foo');} '$C1' '\
+'{ echo -n ":$?; bar"; (exit '$bar');} '$C2' '\
+'{ echo -n ":$?; qux"; (exit '$qux');}; '\
+'echo -n ":$?;"'
+}
+
+## UTILITY FUNCTIONS
+
+function error_in_code(){
+    status=$?
+    echo 'error in tested code' >&2
+    echo "exit status: $status" >&2
+    return "$status"
+}
+
+function assert_output() { local title="$1" expected="$2" code="$3"
+    local result
+    # echo "$code"
+    result=$(eval "$code") || error_in_code || return
+    if [[ "$result" = "$expected" ]]; then
+        echo "OK:"
+        echo "$title"
+        echo "$code"
+        echo "result:   '$result'"
+    else {
+        echo "FAIL:"
+        echo "$title"
+        echo "$code"
+        echo "result:   '$result'"
+        echo "expected: '$expected'"; } >&2
+        return 1
+    fi
+}
+
+(return 0 2>/dev/null) || main "$@"
+echo "done"

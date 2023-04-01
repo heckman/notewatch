@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+#
+
+# set -x
+set -eu
+
+# TEST MODIFYING REFERENCED ARRAYS
+mod () {
+    declare -n array1="$1"
+    array1+=( foogasm )
+}
+
+q=( pick pack )
+mod q
+echo "${q[@]}"
+#@ OUTPUT
+# pick pack foogasm
+
+exit 0
+
+## BASIC TEST
+
+foo () {
+    declare -n array1="$1"
+    declare -n array2="$2"
+
+    echo 'The 1st array:'
+    printf '\t%s\n' "${array1[@]}"
+
+    echo 'The 2nd array:'
+    printf '\t%s\n' "${array2[@]}"
+}
+
+a=( 1 2 3 )
+b=( a b c )
+
+foo a b
+## OUTPUT:
+# The 1st array:
+#         1
+#         2
+#         3
+# The 2nd array:
+#         a
+#         b
+#         c
+
+#from a function: WORKS!
+function bar(){
+    local c=( 1 2 3 )
+    local d=( a b c )
+    foo c d
+}
+
+bar
+## OUTPUT:
+# The 1st array:
+#         1
+#         2
+#         3
+# The 2nd array:
+#         a
+#         b
+#         c
+
+foo c d
+## OUTPUT:
+# The 1st array:
+#
+# The 2nd array:
+#

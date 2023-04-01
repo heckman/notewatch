@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# note-watch
+
+set -o errexit
+set -o pipefail
+# set -o nounset
+# set -o xtrace
+# set -o functrace
+
+[[ "${1-}" = "-x" ]] && { set -o xtrace; shift; }
+
+
+trap 'e="${?:-72}"; echo "[ EXIT $e ]"; exit "$e"' EXIT
+
+
+function error() { local message="${1-}" exit_status="${2-$?}"
+    [[ exit_status -eq 0 ]] && exit_status=1
+    echo "${message:-Error in function: ${FUNCNAME[1]}}" >&2
+    return "${exit_status}"
+}
+
+function one(){ echo "$? one"; }
+function two(){ echo "$? ($(cat)) two"; error "" 2;  }
+function three(){ echo "$? ($(cat)) three"; }
+function four(){ echo "$? ($(cat)) four"; }
+
+function piper(){
+    one | { two || break; } | { three || exit 3; } | four || echo "exit status $?: ${PIPESTATUS[@]}"
+}
+
+piper
+echo [ FIN ]

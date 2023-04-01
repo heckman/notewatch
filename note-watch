@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+#
+# note-watch
+#
+# dependencies
+#	bash (with a read that accepts a timeout < 1)
+#	/usr/bin/python3
+#	/bin/kill
+#	fswatch
+#	realpath (from GNU coreutils)
+
+set -o errexit
+set -o pipefail
+set -o nounset
+# set -o xtrace
+# set -o functrace
+
+[[ "${1-}" = "-x" ]] && { set -o xtrace; shift; }
+
+trap 'e="${?:-72}"; /bin/echo "error on line $LINENO"' ERR
+trap 'e="${?:-72}"; /bin/echo "[ EXIT $e ]"; exit "$e"' EXIT
+
+
+# adapted from https://stackoverflow.com/a/36625791
+SCRIPT_CALLED_AS="$(printf %q "${BASH_SOURCE[0]}")"
+INVOCATION="${SCRIPT_CALLED_AS}$( (($#)) && printf ' %q' "$@")"
+
+PROGRAM_NAME='note-watch'
+
+function define_paths(){ local path="${1:-.}"
+	path=$(abspath "$path")
+	readonly NW_ROOT="$path"
+	readonly NW_DIR="$NW_ROOT/.nw"
+	readonly NW_PID_FILE="$NW_DIR/pid"
+	# /bin/echo "NW_ROOT=$NW_ROOT"
+	# /bin/echo "NW_DIR=$NW_DIR"
+	# /bin/echo "NW_PID_FILE=$NW_PID_FILE"
+	# /bin/echo "NW_PROCESS_NAME=$NW_PROCESS_NAME"
+}
+
+function main() { local command="$1" raw_path="${2:-.}"
+	define_common_errors
+	define_custom_errors
+	define_paths "$raw_path"
+	case "$command" in
+		start) start_watching;;
+		stop) stop_watching;;
+		restart) stop_watching && start_watching;;
+		read) process_incomming_messages;;
+		*) error "$ERR_USAGE" "$INVOCATION";;
+	esac
+	exit
+}
+function process_incomming_fswatch_messages(){
+	while IFS='|' read -rd $'\0' timestamp flags filepath; do
+			echo "${timestamp}°${flags}°${filepath}"
+	done
+}
+
+function start_watching() {
+	ensure_initialized || return
+	! has_pid_file || error "$ERR_ALREADY_RUNNING" "$NW_ROOT"
+	# ( start_fswatch | process_incomming_fswatch_messages ) &
+	( start_watchman ) &
+	/bin/echo $! > "$NW_PID_FILE"
+	announce started
+}
+# QUESTION: Should an eval be used here
+#	rather than reading commands from then argument list?
+function batchify() { local timeout="${1:-0.000001}" # command=...
+	while read -r line; do {
+		echo "$line"
+		while read -rt "$timeout" line; do
+			echo "$line"
+		done
+	} | "${@:2:$#-1}"; done
+}
+function start_watchman() {
+	watchman-wait -m0 -s' ' --fields ino,type,new,exists,name . |
+		batchify 0.02 watchman_batch_handler # awk_batch_reader #watchman_batch_handler
+}
+function awk_batch_reader() {
+	awk -F' ' '
+		$2!="f"    { next } # not a file
+		$4=="True" { extant[$1]=$5;new[$1]=$3;next} # file exists
+				   { extinct[$1]=$5;next} # file does not exist
+		END {
+			for (inode in extinct) {
+				 if (extant[inode]) {
+					renamed[inode]="True"
+					print "rename " extinct[inode] "\t" extant[inode] "\t" new[inode]
+				 } else {
+					print "remove " extinct[inode]
+				 }
+			}
+			for (inode in extant) {
+				if (renamed[inode]) continue
+				if (new[$inode])
+					print "create " extant[inode]
+				else
+					print "update " extant[inode]
+			}
+		}
+	' | while IFS=$'\t' read cmd file1 file2 new; do
+		echo "handle_$cmd" "$file1" "$file2" "$new"
+	done
+}
+function watchman_batch_handler() {
+	local -A extant
+	local -A new
+	local extinct=""
+	while IFS=$' ' read -r inode type is_new exists filename; do
+		[[ "$type" = "f" ]] || continue # only process regular files
+		if "$exists"; then
+			extant+=([$inode]="$filename")
+			new+=([$inode]="$is_new")
+		else
+			extinct="${extinct}${inode} ${filename}"$'\n'
+		fi
+	done
+	### PROCESS NON-EXISTING FILES
+	local -A renamed
+	while IFS=$' ' read -r inode filename; do
+		[[ -n $inode ]] || continue # skip empwty lines
+		if [[ -n "${extant[$inode]:-}" ]]; then
+			renamed+=([$inode]="True")
+			handle_rename "${filename}" "${extant[$inode]}" "${new[$inode]}"
+		else
+			handle_remove "${filename}"
+		fi
+	done <<<"$extinct"
+	### PROCESS EXISTING FILES
+	for inode in "${!extant[@]}"; do
+		"${renamed[$inode]:-False}" && continue # skip files renamed to
+		if "${new[$inode]}"; then
+			handle_create "${extant[$inode]}"
+		else
+			handle_update "${extant[$inode]}"
+		fi
+	done
+}
+function handle_rename(){ local from="$1" to="$2" is_new="$3"
+	local warning=""
+	! "$is_new" && warning=" (WARNING: existing file overwritten)"
+	echo "rename: ${from} -> ${to}${warning}"
+}
+function handle_remove(){ local filename="$1"
+	echo "remove: $filename"
+}
+function handle_create(){ local filename="$1"
+	echo "create: $filename"
+}
+function handle_update(){ local filename="$1"
+	echo "update: $filename"
+}
+function start_fswatch(){
+	fswatch \
+		--latency 1 \
+		--print0 \
+		--format '%t|%f|%p' \
+		--utc-time --format-time '%FT%T' \
+		--event-flag-separator ' ' \
+		--batch-marker='---' \
+		--recursive "$NW_ROOT"
+}
+
+function stop_watching() {
+	local pid
+	pid=$(ensure_running) || return
+	kill_group_of_process "$pid" "$PROGRAM_NAME" || return
+	rm "$NW_PID_FILE" || "$NW_ERR_CANT_REMOVE_PID_FILE" "$NW_PID_FILE" || return
+	announce stopped
+}
+function ensure_initialized() {
+	[[ -d "$NW_DIR" ]] || error "$ERR_NOT_INITIALIZED" "$NW_ROOT" || return
+}
+function ensure_running() {
+	ensure_initialized || return
+	has_pid_file || error "$ERR_NOT_RUNNING" "$NW_ROOT" || return
+	local pid
+	pid=$(nw_pid) || return
+	validate_pid "$pid" "$PROGRAM_NAME" || return
+	echo "$pid"
+}
+function has_pid_file(){
+	[[ -f "$NW_PID_FILE" ]]
+}
+function nw_pid(){
+	read_file "$NW_PID_FILE" || error "$NW_ERR_CANT_READ_PID_FILE" || return
+}
+function nw_process(){
+	ensure_initialized || return
+	has_pid_file || error "$ERR_NOT_RUNNING" "$NW_ROOT" || return
+	pid=$(NW_PID_FILE) || error "$NW_ERR_CANT_READ_PID_FILE" || return
+	process_name "$pid" || return
+}
+
+
+function announce() { local announcement_name="$1"
+	case "$announcement_name" in
+		stopped) /bin/echo "$PROGRAM_NAME has stopped watching $NW_ROOT";;
+		*) /bin/echo "  for directory ";;
+	esac
+}
+
+
+function define_custom_errors() {
+	  NW_ERR_CANT_READ_PID_FILE=128  ERR_MSG_128="can't read pid file"
+	NW_ERR_CANT_REMOVE_PID_FILE=129  ERR_MSG_129="can't remove pid file"
+	# override default error messages:
+	printf -v "ERR_MSG_$ERR_ALREADY_RUNNING" '%s' "already watching directory"
+	printf -v "ERR_MSG_$ERR_NOT_RUNNING" '%s' "not watching directory"
+	printf -v "ERR_MSG_$ERR_UNEXPECTED_PROCESS" '%s' "not a note-watch process"
+}
+
+###############################################################################
+# UTILITY FUNCTIONS
+###############################################################################
+function define_error() { :;}
+function define_common_errors() {
+					  ERR_USAGE=64  ERR_MSG_64="invalid usage"
+				ERR_INVALID_PID=4   ERR_MSG_4="badly formatted pid"
+			ERR_ALREADY_RUNNING=2   ERR_MSG_2="already running"
+				ERR_NOT_RUNNING=8   ERR_MSG_8="not running"
+			ERR_NOT_INITIALIZED=12  ERR_MSG_12="notebook not initialized"
+			 ERR_CANT_READ_FILE=194 ERR_MSG_194="can't read file"
+		 ERR_UNEXPECTED_PROCESS=253 ERR_MSG_253="unexpected process"
+		  ERR_PROCESS_NOT_FOUND=125 ERR_MSG_125="process not found"
+	ERR_CANT_KILL_PROCESS_GROUP=123 ERR_MSG_123="can't kill process group"
+				ERR_UNSPECIFIED=254 ERR_MSG_254="unspecified"
+				 ERR_ASSERTTION=255 ERR_MSG_255="assertion failed"
+}
+function error() { local error_id="$1" argument="${2:-}"
+	local exit_status=$?
+	local message
+	message=$(dereference "$error_id" 'ERR_MSG_') || {
+		argument="error_id='$error_id' exit_status='$exit_status'; argument='$argument';"
+		error_id="$ERR_UNSPECIFIED"
+		message=$(dereference "$error_id" 'ERR_MSG_')
+	}
+	[[ -n "$argument" ]] && message="${message} (${argument})"
+	# TODO: log_error "$error_id" "$message"
+	if [[ error_id = "$ERR_USAGE" ]]; then
+		(usage) # in case it tries to exit!
+	else
+		/bin/echo "ERROR: $message" >&2
+	fi
+	return "$error_id"
+}
+function is_unset() { local variable="$1"
+	test -z "${variable+x}"
+}
+function dereference() { local name="$1" prefix="${2:-}"
+	name="${prefix}${name}"
+	! is_unset "$name" || return
+	/usr/bin/printf "%s" "${!name}"
+}
+# function log_error() {
+# 	/usr/bin/printf "ERROR %2d: %s%s\n" "$error_id" "$message"
+# }
+function kill_group_of_process(){ local pid="${1:-}" process_substring="$2"
+	validate_pid "$pid" "$process_substring" || return
+	pgid=$(pgid "$pid") || return
+	kill_group "$pgid" 2>/dev/null || return
+}
+# output: file contents of specified file
+# throws: ERR_INVALID_PID
+# passes: ERR_PROCESS_NOT_FOUND, ERR_UNEXPECTED_PROCESS
+function validate_pid(){ local pid="$1" process_substring="${2-}"
+	[[ "$pid" -gt 0 ]] || error "$ERR_INVALID_PID" "$pid" || return
+	[[ -n "$process_substring" ]] || return # don't check the name
+	local process_name
+	process_name=$(process_name "$pid") || return
+	contains "$process_name" "$process_substring" || error \
+		"$ERR_UNEXPECTED_PROCESS" \
+		"'$process_name' should be start with '$process_substring'" || return
+}
+# output: file contents of specified file
+# throws: ERR_CANT_READ_FILE
+function read_file(){ filename="$1"
+	/bin/cat "$filename" 2>/dev/null || error "$ERR_CANT_READ_FILE" "$filename"
+}
+
+# output: pgid of specified pid
+# throws: ERR_PROCESS_NOT_FOUND
+function pgid(){ local pid="$1"
+	/bin/ps -o pgid= "$pid" 2>/dev/null || error "$ERR_PROCESS_NOT_FOUND" "$pid"
+}
+
+# output: (undefined)
+# throws: ERR_CANT_KILL_PROCESS_GROUP
+function kill_group(){ local pgid="$1"
+	/bin/kill -- "-$pgid" 2>/dev/null || error "$ERR_CANT_KILL_PROCESS_GROUP" "$pgid"
+}
+function process_name(){ local pid="$1"
+	/bin/ps -o command= -p "$pid" 2>/dev/null || error "$ERR_PROCESS_NOT_FOUND" "$pid"
+}
+function starts_with(){ local string="" substring=""
+	[[ ${string:0:${#substring}} = "$substring" ]]
+}
+function contains(){ local string="" substring=""
+	[[ "$string" = *"$substring"* ]]
+}
+
+function abspath() { local path="$1"
+	/usr/bin/python3 -c "import sys, os.path
+print((sys.argv[1]))" "$path" # will abort if this fails
+	return 0
+}
+
+
+###############################################################################
+#	run main function unless sourced (which we'll do when testing)
+#
+#	only reliable when sourced with bash
+#	method described by mklement0
+#	at https://stackoverflow.com/a/28776166
+#
+
+# (return 0 2>/dev/null) && main "$@"
+
+main "$@"

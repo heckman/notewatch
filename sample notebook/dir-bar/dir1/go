@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+echo gone
+pwd
+echo "$PWD"

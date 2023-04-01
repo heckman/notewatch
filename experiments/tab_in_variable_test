@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+
+# CONCLUSION: nulls are not be saved within variable
+
+set -o errexit
+set -o pipefail
+set -o nounset
+# set -o xtrace
+set -o functrace
+set -o errtrace
+
+[[ "${1-}" = "-x" ]] && { set -o xtrace; shift; }
+
+
+tab=$'\t'
+null=$'\0'
+newline=$'\n'
+bell=$'\a'
+
+echo TAB:
+echo "foo${tab}bar"
+echo "foo${tab}bar" | tr $'\t' '-'
+echo
+echo NULL:
+echo "foo${null}bar"
+echo "foo${null}bar" | tr $'\0' '-'
+echo
+echo NEWLINE:
+echo "foo${newline}bar"
+echo "foo${newline}bar" | tr $'\n' '-'
+echo
+echo
+echo BELL:
+echo "foo${bell}bar"
+echo "foo${bell}bar" | tr $'\a' '-'
+echo
